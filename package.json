@@ -1,0 +1,13 @@
+{
+  "name": "toolsenabled-relay",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Server-side rendezvous relay for ToolsEnabled: verifies signed leases, pairs endpoints, and forwards sealed frames it cannot read.",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "test": "node tests/run.js",
+    "test:crossrepo": "node tests/hosted-relay-drop-in.js"
+  }
+}

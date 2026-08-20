@@ -1,0 +1,91 @@
+ToolsEnabled relay
+Copyright (c) 2026 Joshua Pinckard
+
+This product is licensed under the MIT License. The full text is in LICENSE,
+and nothing in this file narrows the permission that file grants.
+
+-------------------------------------------------------------------------------
+WHAT THIS REPOSITORY IS, AND WHAT IT IS NOT
+-------------------------------------------------------------------------------
+
+This is the server-side half of ToolsEnabled's connectivity: a rendezvous relay
+that verifies signed short leases, pairs exactly two endpoints, and forwards
+sealed frames it cannot open. It is published so that a person who wants to run
+their own can read every line of what they would be running.
+
+It is NOT the account service. The relay reads the account service's device
+records read-only, over the local filesystem, and holds no accounts, no billing
+and no customer content of its own. Deploying this repository does not give you
+the hosted service; it gives you the part a self-hoster needs.
+
+The client half -- everything that runs on a customer's own machine -- is
+licensed the same way and is released from the ToolsEnabled engine repository.
+
+-------------------------------------------------------------------------------
+CRYPTOGRAPHY
+-------------------------------------------------------------------------------
+
+This software uses cryptography solely through platform primitives -- Node.js
+`node:crypto` and, at the browser edge, WebCrypto. It implements no cryptographic
+algorithm of its own and contains no homegrown construction, and it declares no
+third-party dependency of any kind.
+
+The primitives it calls are:
+
+  - Ed25519 signature verification, over lease material and over the nonce a
+    browser signs to prove possession of its key.
+  - SHA-256, for lease and key fingerprints.
+  - X.509 certificate parsing, to read the fingerprint of a client certificate
+    presented at the TLS edge. Parsing only: this software issues no
+    certificate and signs nothing.
+  - Constant-time comparison, and random generation for nonces.
+
+It forwards frames sealed by its endpoints and holds no key that can open them.
+
+-------------------------------------------------------------------------------
+LEGAL STATUS
+-------------------------------------------------------------------------------
+
+ToolsEnabled, Inc. has not been incorporated. It is named as the intended
+publisher and is marked "(in formation)" for that reason. Copyright is held
+personally by Joshua Pinckard until the entity exists and the rights are
+assigned to it; this NOTICE is updated at that point.
+
+No trademark application has been filed for "ToolsEnabled", and the name is not
+claimed here as a REGISTERED mark. The reservation below is of common-law
+rights in the name, which is a different thing and does not depend on a filing.
+
+The trademark section below was drafted in-house and has not been reviewed by
+outside counsel. It states a boundary that already exists rather than creating
+one: MIT grants copyright permissions and never granted trademark rights.
+
+-------------------------------------------------------------------------------
+TRADEMARKS
+-------------------------------------------------------------------------------
+
+"ToolsEnabled", "ToolsEnabled Anywhere", and the ToolsEnabled logos are
+trademarks of Joshua Pinckard (assignment to ToolsEnabled, Inc. planned upon
+its formation). The MIT License above grants copyright permissions only; it
+does not grant permission to use these names or logos.
+
+What this means in practice:
+
+  - You may use, modify, redistribute and sell this software under the MIT
+    License, and you may truthfully state that your work is based on or
+    compatible with ToolsEnabled.
+  - You may not name a fork, derivative, product, or service "ToolsEnabled"
+    (or a confusingly similar name), and you may not use the names or logos
+    in a way that suggests your distribution is published, endorsed by, or
+    affiliated with us.
+  - If you distribute a modified version, give it your own name.
+
+Nothing here restricts fair or nominative use of the names to describe
+provenance ("a fork of ToolsEnabled") or compatibility.
+
+-------------------------------------------------------------------------------
+THIRD-PARTY CODE
+-------------------------------------------------------------------------------
+
+None. This repository declares no runtime and no development dependencies; it
+runs on the Node.js standard library alone. There is therefore no third-party
+licence to reproduce here, and no copyleft obligation attaches to this work.
