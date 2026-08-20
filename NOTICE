@@ -27,8 +27,9 @@ CRYPTOGRAPHY
 
 This software uses cryptography solely through platform primitives -- Node.js
 `node:crypto` and, at the browser edge, WebCrypto. It implements no cryptographic
-algorithm of its own and contains no homegrown construction, and it declares no
-third-party dependency of any kind.
+algorithm of its own and contains no homegrown construction. Its one third-party
+dependency, the websocket library, performs no cryptography beyond the
+SHA-1 handshake digest RFC 6455 mandates.
 
 The primitives it calls are:
 
@@ -86,6 +87,15 @@ provenance ("a fork of ToolsEnabled") or compatibility.
 THIRD-PARTY CODE
 -------------------------------------------------------------------------------
 
-None. This repository declares no runtime and no development dependencies; it
-runs on the Node.js standard library alone. There is therefore no third-party
-licence to reproduce here, and no copyleft obligation attaches to this work.
+One runtime dependency, used only by the websocket edge:
+
+  ws  -- https://github.com/websockets/ws
+         Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
+         Copyright (c) 2013 Arnout Kazemier and contributors
+         Copyright (c) 2016 Luigi Pinca and contributors
+         MIT License. It is not vendored; its own LICENSE accompanies it
+         wherever it is installed.
+
+No development dependencies. No copyleft obligation attaches to this work.
+The admission, routing and lease logic use the Node.js standard library
+alone; a control-only deployment runs with nothing installed.

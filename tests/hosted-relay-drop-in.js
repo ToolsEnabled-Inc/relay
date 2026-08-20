@@ -100,6 +100,20 @@ const {
   HOSTED_RELAY_DEPLOYMENT_MARKER
 } = require(ENGINE_ENTITLEMENT);
 const license = require(path.join(ENGINE_REPO, 'src', 'lib', 'providers', 'license.js'));
+// Minting moved out of the open verification module (license-issuance.js is
+// the owner-side half and is withheld from the engine's public cut). This test
+// runs beside a FULL engine checkout, so prefer the issuance module and fall
+// back for older trees; refuse -- like every other absence here -- if neither
+// side of the split can mint.
+const issueKey = (() => {
+  try { return require(path.join(ENGINE_REPO, 'src', 'lib', 'providers', 'license-issuance.js')).issueKey; }
+  catch { /* older engine tree: minting still lives in license.js */ }
+  return license.issueKey;
+})();
+if (typeof issueKey !== 'function') {
+  console.error('REFUSED: the engine checkout beside this repo cannot mint a license (license-issuance.js absent and license.js does not issue).');
+  process.exit(2);
+}
 const { sha256 } = require(path.join(ENGINE_REPO, 'src', 'lib', 'audit-store.js'));
 const { LicenseStore } = require(path.join(ENGINE_REPO, 'src', 'lib', 'license-store.js'));
 
@@ -212,7 +226,7 @@ withTempLicenseStore(store => {
   const signer = makeSigner();
   const licenseNow = Date.parse('2026-08-01T00:00:00.000Z');
   const licenseDeps = { signer, store, now: () => licenseNow, assertActive: () => {}, record: () => {} };
-  const validLicense = license.issueKey({
+  const validLicense = issueKey({
     product: 'toolsenabled-operator-cloud', licensee: 'hosted-pair-customer', expiresAt: '2027-08-01T00:00:00.000Z', licenseId: 'lic_hostedpair01'
   }, licenseDeps);
 

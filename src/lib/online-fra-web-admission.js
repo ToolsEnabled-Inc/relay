@@ -65,7 +65,13 @@ function createOnlineFraWebAdmission({ relay, clock = () => Date.now() } = {}) {
    * one, in the lease state) nor a challenge replay window beyond its own.
    */
   function admit({ lease, browserPublicKeySpki, nonce, signature } = {}) {
-    if (!lease || lease.endpointRole !== 'web-client') fail('ONLINE_FRA_WEB_ADMISSION_ROLE_INVALID');
+    // ANY ROLE. This began as the browser's door because a browser cannot
+    // present a client certificate. Machines may now use it too, signing with
+    // the identity key they generated themselves -- see the note in
+    // online-fra-rendezvous-relay.js validateIdentity() for why that is the
+    // stronger of the two shapes. The role set is the lease schema's, and a
+    // lease with any other role was already refused at the signature check.
+    if (!lease || !['web-client', 'machine-a', 'machine-b'].includes(lease.endpointRole)) fail('ONLINE_FRA_WEB_ADMISSION_ROLE_INVALID');
 
     // The nonce: known, unexpired, and SINGLE-USE -- deleted before any
     // verification, so even a verification crash cannot leave it replayable.
@@ -98,7 +104,9 @@ function createOnlineFraWebAdmission({ relay, clock = () => Date.now() } = {}) {
     if (proven !== true) fail('ONLINE_FRA_WEB_ADMISSION_PROOF_INVALID');
 
     return relay.connect({
-      identity: Object.freeze({ verified: true, authType: 'web-lease', deviceId: lease.deviceId, mtlsFingerprint: lease.mtlsFingerprint }),
+      // 'web-lease' is what this module attested before it admitted machines; the
+      // relay accepts both names for the web role so nothing in flight breaks.
+      identity: Object.freeze({ verified: true, authType: 'key-lease', deviceId: lease.deviceId, mtlsFingerprint: lease.mtlsFingerprint }),
       lease
     });
   }

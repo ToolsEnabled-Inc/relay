@@ -9,5 +9,8 @@
   "scripts": {
     "test": "node tests/run.js",
     "test:crossrepo": "node tests/hosted-relay-drop-in.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
   }
 }

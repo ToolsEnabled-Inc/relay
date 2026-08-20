@@ -36,13 +36,13 @@ function signed(nonce, key = browser.privateKey) {
   return crypto.sign(null, Buffer.from(nonce, 'base64url'), key).toString('base64url');
 }
 
-// The happy dance: challenge -> sign -> admit, and the relay sees web-lease.
+// The happy dance: challenge -> sign -> admit, and the relay sees key-lease.
 {
   const { admission, connects } = harness();
   const { nonce } = admission.challenge();
   const receipt = admission.admit({ lease: webLease, browserPublicKeySpki: browserWire, nonce, signature: signed(nonce) });
   equal(receipt.connectionId, 'conn_1');
-  equal(connects[0].identity.authType, 'web-lease');
+  equal(connects[0].identity.authType, 'key-lease');
   equal(connects[0].identity.mtlsFingerprint, fingerprint);
 }
 
@@ -91,11 +91,24 @@ function signed(nonce, key = browser.privateKey) {
   ok(admission.pendingChallenges() <= 1024, `bounded (${admission.pendingChallenges()})`);
 }
 
-// A machine lease cannot come through the web door.
+// MACHINES MAY COME THROUGH THIS DOOR TOO (2026-08-20). A machine signing with
+// the Ed25519 identity key it generated itself is the stronger shape -- the
+// mTLS path's private key is generated server-side and travels -- so the door
+// is no longer the browser's alone. Same dance, same checks, both machine roles.
+for (const role of ['machine-a', 'machine-b']) {
+  const { admission, connects } = harness();
+  const { nonce } = admission.challenge();
+  const receipt = admission.admit({ lease: { ...webLease, endpointRole: role }, browserPublicKeySpki: browserWire, nonce, signature: signed(nonce) });
+  equal(typeof receipt.connectionId, 'string');
+  equal(connects[0].identity.authType, 'key-lease');
+  equal(connects[0].lease.endpointRole, role);
+}
+
+// A role the lease schema does not name is still refused.
 {
   const { admission } = harness();
   const { nonce } = admission.challenge();
-  code(() => admission.admit({ lease: { ...webLease, endpointRole: 'machine-a' }, browserPublicKeySpki: browserWire, nonce, signature: signed(nonce) }),
+  code(() => admission.admit({ lease: { ...webLease, endpointRole: 'operator' }, browserPublicKeySpki: browserWire, nonce, signature: signed(nonce) }),
     'ONLINE_FRA_WEB_ADMISSION_ROLE_INVALID');
 }
 

@@ -39,7 +39,7 @@ function fixture(overrides = {}) {
   const httpServer = { handlers: new Map(), on(name, fn) { this.handlers.set(name, fn); }, off(name) { this.handlers.delete(name); } };
   const relay = {
     connect(input) { relay.connects.push(input); return { connectionId: 'connection-1' }; },
-    connectionMetadata(id) { relay.metadata.push(id); return { peerConnectionId: 'peer-1' }; },
+    connectionMetadata(id) { relay.metadata.push(id); return { peerConnectionId: 'peer-1', endpointRole: 'machine-a', legs: { 'machine-a': id, 'machine-b': 'peer-1', 'web-client': null } }; },
     route(input) { routes.push(input); },
     take(id) { relay.takes.push(id); return outbound.shift() ?? null; },
     close(id, reason) { relay.closes.push({ id, reason }); },
@@ -78,7 +78,7 @@ function upgrade(test, request = { method: 'GET', url: '/v1/rendezvous' }, ws = 
   first.ws.emit('message', Buffer.from('{"lease":{"id":"PRIVATE-MARKER"}}'), false);
   equal(test.relay.connects.length, 1); equal(test.relay.metadata.length, 2); equal(test.events.at(-1).type, 'online_fra.ws.admitted'); ok(!JSON.stringify(test.events).includes('PRIVATE-MARKER'));
   equal(test.relay.connects[0].identity.authType, 'mtls');
-  first.ws.emit('message', Buffer.from('abc'), true); equal(test.routes.length, 1); equal(test.routes[0].peerConnectionId, 'peer-1'); ok(Buffer.isBuffer(test.routes[0].frame));
+  first.ws.emit('message', Buffer.concat([Buffer.from([0x02]), Buffer.from('abc')]), true); equal(test.routes.length, 1); equal(test.routes[0].peerConnectionId, 'peer-1'); ok(Buffer.isBuffer(test.routes[0].frame)); equal(test.routes[0].frame[0], 0x01, 'the edge stamps the SOURCE leg in place of the target byte'); equal(test.routes[0].frame.subarray(1).toString(), 'abc', 'and leaves the payload alone');
   test.outbound.push(Buffer.from('out-1'), Buffer.from('out-2')); test.adapter.drain(); equal(first.ws.sent.length, 2); ok(first.ws.sent.every(item => item.options.binary === true));
   first.ws.bufferedAmount = 2000; test.outbound.push(Buffer.from('blocked')); test.adapter.drain(); equal(first.ws.sent.length, 2);
   first.ws.bufferedAmount = 0; test.timers.advance(10); equal(first.ws.pings, 1); first.ws.emit('pong'); test.timers.advance(10); equal(first.ws.pings, 2);
@@ -88,17 +88,17 @@ function upgrade(test, request = { method: 'GET', url: '/v1/rendezvous' }, ws = 
   { const admission = fixture(); admission.adapter.start(); const { ws } = upgrade(admission); ws.emit('message', Buffer.from('{"bad":1}'), false); equal(ws.closed.length, 1); equal(admission.adapter.snapshot().sockets, 0); }
   { const timeout = fixture(); timeout.adapter.start(); const { ws } = upgrade(timeout); timeout.timers.advance(21); equal(ws.closed.length, 1); equal(timeout.adapter.snapshot().sockets, 0); }
   { const idle = fixture(); idle.adapter.start(); const { ws } = upgrade(idle); ws.emit('message', Buffer.from('{"lease":1}'), false); idle.timers.advance(31); equal(ws.closed.at(-1), 1001); }
-  { const frame = fixture(); frame.adapter.start(); const { ws } = upgrade(frame); ws.emit('message', Buffer.from('{"lease":1}'), false); ws.emit('message', Buffer.alloc(1025), true); equal(ws.closed.length, 1); }
+  { const frame = fixture(); frame.adapter.start(); const { ws } = upgrade(frame); ws.emit('message', Buffer.from('{"lease":1}'), false); ws.emit('message', Buffer.concat([Buffer.from([0x02]), Buffer.alloc(1024)]), true); equal(ws.closed.length, 1); }
   {
     let paired = false; const routes = [];
     const relay = {
       connect: () => ({ connectionId: 'connection-1' }),
-      connectionMetadata: () => ({ peerConnectionId: paired ? 'peer-1' : null }),
+      connectionMetadata: () => ({ peerConnectionId: paired ? 'peer-1' : null, endpointRole: 'machine-a', legs: { 'machine-a': 'connection-1', 'machine-b': paired ? 'peer-1' : null, 'web-client': null } }),
       route: input => routes.push(input), take: () => null, close() {}
     };
     const awaiting = fixture({ relay }); awaiting.adapter.start(); const { ws } = upgrade(awaiting);
     ws.emit('message', Buffer.from('{"lease":1}'), false); equal(ws.closed.length, 0, 'first endpoint remains admitted while its peer connects');
-    paired = true; ws.emit('message', Buffer.from('opaque'), true); equal(routes.length, 1);
+    paired = true; ws.emit('message', Buffer.concat([Buffer.from([0x02]), Buffer.from('opaque')]), true); equal(routes.length, 1);
   }
   { const badRelay = fixture({ relay: { connect: () => Promise.resolve({}), route() {}, take() { return null; }, close() {}, connectionMetadata() { return { peerConnectionId: 'peer-1' }; } } }); badRelay.adapter.start(); const { ws } = upgrade(badRelay); ws.emit('message', Buffer.from('{"lease":1}'), false); equal(ws.closed.length, 1); }
   { const sink = fixture({ eventSink: () => { throw new Error('sink'); } }); sink.adapter.start(); const result = upgrade(sink); equal(result.ws.closed.length, 1); equal(sink.adapter.snapshot().sockets, 0); }
@@ -135,6 +135,106 @@ function upgrade(test, request = { method: 'GET', url: '/v1/rendezvous' }, ws = 
     equal(ws.closed.length, 0, 'the adapter identity is accepted by the real relay while awaiting the peer');
     equal(realRelay.snapshot().activeConnections, 1); ws.emit('close'); equal(realRelay.snapshot().activeConnections, 0);
   }
+
+  // KEY-POSSESSION MODE. No certificate: the request carries no attestation, so
+  // with `keyAdmission` configured the socket is admitted provisionally, the
+  // edge's FIRST frame is the challenge, and the endpoint's first frame is the
+  // proof -- which must quote THIS socket's nonce, not just any valid one.
+  {
+    const crypto = require('node:crypto');
+    const { createOnlineFraWebAdmission } = require('../src/lib/online-fra-web-admission');
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const spki = publicKey.export({ type: 'spki', format: 'der' });
+    const fingerprint = crypto.createHash('sha256').update(spki).digest('hex');
+    const lease = { endpointRole: 'machine-a', deviceId: 'device-k', mtlsFingerprint: fingerprint };
+    const sign = nonce => crypto.sign(null, Buffer.from(nonce, 'base64url'), privateKey).toString('base64url');
+    const noCert = () => ({ ok: false });
+    // The relay double is built first so the admission and the adapter share it.
+    const relayDouble = () => { const connects = []; return { connects, metadata: [], takes: [], closes: [],
+      connect(input) { connects.push(input); return { connectionId: 'connection-1' }; },
+      connectionMetadata(id) { return { peerConnectionId: 'peer-1', endpointRole: 'machine-a', legs: { 'machine-a': id, 'machine-b': 'peer-1', 'web-client': null } }; }, route() {}, take() { return null; }, close() {} }; };
+
+    // 1. A proof quoting some OTHER socket's nonce closes this socket and never reaches the relay.
+    {
+      const relay = relayDouble();
+      const keyAdmission = createOnlineFraWebAdmission({ relay, clock: () => 1 });
+      const k = fixture({ relay, verifyProxyRequest: noCert, keyAdmission, maxAdmissionBytes: 2048, clientIpFor: () => '10.0.0.9' });
+      k.adapter.start();
+      const { socket, ws } = upgrade(k);
+      equal(socket.destroyed, false, 'no certificate + key admission configured -> accepted provisionally');
+      equal(ws.sent.length, 1, 'the edge speaks first');
+      equal(typeof JSON.parse(ws.sent[0].data.toString('utf8')).challenge, 'string');
+      const other = keyAdmission.challenge().nonce;
+      ws.emit('message', Buffer.from(JSON.stringify({ lease, publicKeySpki: spki.toString('base64url'), nonce: other, signature: sign(other) })), false);
+      equal(ws.readyState, 3, 'another socket\'s nonce closes this one');
+      equal(relay.connects.length, 0, 'and never reaches the relay');
+    }
+
+    // 2. Right nonce, right key, right signature: admitted, and the relay sees key-lease with the lease's fingerprint.
+    {
+      const relay = relayDouble();
+      const keyAdmission = createOnlineFraWebAdmission({ relay, clock: () => 1 });
+      const g = fixture({ relay, verifyProxyRequest: noCert, keyAdmission, maxAdmissionBytes: 2048, clientIpFor: () => '10.0.0.10' });
+      g.adapter.start();
+      const { ws } = upgrade(g);
+      const nonce = JSON.parse(ws.sent[0].data.toString('utf8')).challenge;
+      ws.emit('message', Buffer.from(JSON.stringify({ lease, publicKeySpki: spki.toString('base64url'), nonce, signature: sign(nonce) })), false);
+      equal(ws.readyState, 1, 'admitted');
+      equal(relay.connects.length, 1);
+      equal(relay.connects[0].identity.authType, 'key-lease');
+      equal(relay.connects[0].identity.mtlsFingerprint, fingerprint);
+      equal(relay.connects[0].identity.deviceId, 'device-k');
+    }
+
+    // 3. A wrong signature with the right nonce: closed, not admitted.
+    {
+      const relay = relayDouble();
+      const keyAdmission = createOnlineFraWebAdmission({ relay, clock: () => 1 });
+      const b = fixture({ relay, verifyProxyRequest: noCert, keyAdmission, maxAdmissionBytes: 2048, clientIpFor: () => '10.0.0.11' });
+      b.adapter.start();
+      const { ws } = upgrade(b);
+      const nonce = JSON.parse(ws.sent[0].data.toString('utf8')).challenge;
+      ws.emit('message', Buffer.from(JSON.stringify({ lease, publicKeySpki: spki.toString('base64url'), nonce, signature: sign('AAAA') })), false);
+      equal(ws.readyState, 3, 'bad signature closes the socket');
+      equal(relay.connects.length, 0);
+    }
+
+    // 4. Without keyAdmission, no certificate still means rejection at upgrade -- unchanged behaviour.
+    {
+      const none = fixture({ verifyProxyRequest: noCert });
+      none.adapter.start();
+      equal(upgrade(none).socket.destroyed, true, 'mTLS-only deployments reject exactly as before');
+    }
+
+    // 4b. A frame to a leg that is not connected yet is DROPPED and counted -- the
+    //     sender keeps its socket, because "peer not here yet" is the normal state
+    //     while two machines race to connect, not a protocol violation.
+    {
+      const relay = relayDouble();
+      relay.connectionMetadata = (id) => ({ peerConnectionId: null, endpointRole: 'machine-a', legs: { 'machine-a': id, 'machine-b': null, 'web-client': null } });
+      const keyAdmission = createOnlineFraWebAdmission({ relay, clock: () => 1 });
+      const early = fixture({ relay, verifyProxyRequest: noCert, keyAdmission, maxAdmissionBytes: 2048, clientIpFor: () => '10.0.0.12' });
+      early.adapter.start();
+      const { ws } = upgrade(early);
+      const nonce = JSON.parse(ws.sent[0].data.toString('utf8')).challenge;
+      ws.emit('message', Buffer.from(JSON.stringify({ lease, publicKeySpki: spki.toString('base64url'), nonce, signature: sign(nonce) })), false);
+      equal(ws.readyState, 1, 'admitted alone');
+      ws.emit('message', Buffer.concat([Buffer.from([0x02]), Buffer.from('hello-too-early')]), true);
+      equal(ws.readyState, 1, 'a frame to the absent peer does NOT close the socket');
+      equal(early.routes.length, 0, 'and is not routed');
+      equal(early.events.filter(e => e.type === 'online_fra.ws.frame_dropped' && e.reason === 'leg_absent').length, 1, 'it is counted');
+    }
+
+    // 5. An unusable client IP is refused before any challenge is issued.
+    {
+      const relay = relayDouble();
+      const keyAdmission = createOnlineFraWebAdmission({ relay, clock: () => 1 });
+      const bad = fixture({ relay, verifyProxyRequest: noCert, keyAdmission, maxAdmissionBytes: 2048, clientIpFor: () => 'not-an-ip' });
+      bad.adapter.start();
+      equal(upgrade(bad).socket.destroyed, true, 'no usable client address -> rejected at upgrade');
+    }
+  }
+
   ok(DEFAULTS.maxFrameBytes > 0);
   console.log(`Online FRA websocket adapter tests passed (${assertions} assertions).`);
 })();

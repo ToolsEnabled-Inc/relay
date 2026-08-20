@@ -433,8 +433,21 @@ function createOnlineFraRendezvousRelay(options = {}) {
     // fingerprint slot) and attests that here as authType 'web-lease'. The
     // consistency checks below are identical for both: same fields, same
     // meaning -- 'the fingerprint of the identity this endpoint presented'.
-    const expectedAuth = lease.endpointRole === 'web-client' ? 'web-lease' : 'mtls';
-    if (identity.verified !== true || identity.authType !== expectedAuth) fail('ONLINE_FRA_MTLS_IDENTITY_INVALID');
+    // ONE MORE AUTH TYPE, FOR EVERY ROLE: 'key-lease' -- the endpoint proved
+    // possession of the key whose SPKI SHA-256 the lease commits to, by signing
+    // the edge's nonce (online-fra-web-admission.js). It was built for the web
+    // role because browsers cannot present a client certificate. It is now
+    // accepted for MACHINE roles too, and the reason is the one device-ca.js
+    // records against itself: under the mTLS path the client private key is
+    // generated on the server and travels to the machine, because the engine
+    // cannot build a CSR. Under key-lease the machine signs with the Ed25519
+    // identity key it generated and never sent anywhere -- the same key peer
+    // introduction pins. That is the stronger shape, not the weaker one, and it
+    // needs no CA to operate. 'mtls' stays valid for machines; nothing that
+    // admitted before stops admitting now.
+    const role = lease.endpointRole;
+    const acceptedAuth = role === 'web-client' ? ['web-lease', 'key-lease'] : ['mtls', 'key-lease'];
+    if (identity.verified !== true || !acceptedAuth.includes(identity.authType)) fail('ONLINE_FRA_MTLS_IDENTITY_INVALID');
     if (identifier(identity.deviceId, 'ONLINE_FRA_MTLS_IDENTITY_INVALID') !== lease.deviceId
         || digest(identity.mtlsFingerprint, 'ONLINE_FRA_MTLS_IDENTITY_INVALID') !== lease.mtlsFingerprint) {
       fail('ONLINE_FRA_MTLS_IDENTITY_MISMATCH');
@@ -571,10 +584,18 @@ function createOnlineFraRendezvousRelay(options = {}) {
     expireConnections(now());
     const record = recordFor(connectionId);
     assertPairActive(record);
+    // EVERY LEG OF THIS PAIR, BY ROLE. The edge needs this to address a frame:
+    // a machine talks to its peer machine AND to the pair's web slot over one
+    // socket, and a browser talks to either machine. peerConnectionId stays
+    // exactly what it was -- the machine<->machine link -- so nothing that
+    // read it before reads anything different now.
+    const pairSlots = slots.get(pairSlotKey(record));
+    const legOf = role => { const leg = pairSlots ? pairSlots.get(role) : undefined; return leg && !leg.closed ? leg.connectionId : null; };
     return Object.freeze({
       connectionId: record.connectionId, pairId: record.pairId, deviceId: record.deviceId,
       peerDeviceId: record.peerDeviceId, endpointRole: record.endpointRole, generation: record.generation,
-      peerConnectionId: record.peerConnectionId, queuedBytes: record.queuedBytes, expiresAtMs: record.expiresAtMs
+      peerConnectionId: record.peerConnectionId, queuedBytes: record.queuedBytes, expiresAtMs: record.expiresAtMs,
+      legs: Object.freeze({ 'machine-a': legOf('machine-a'), 'machine-b': legOf('machine-b'), 'web-client': legOf('web-client') })
     });
   }
 

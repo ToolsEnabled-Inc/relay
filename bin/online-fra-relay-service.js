@@ -11,7 +11,10 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const http = require('node:http');
 const { createOnlineFraRelayService } = require('../src/lib/online-fra-relay-service');
+const { createOnlineFraWebAdmission } = require('../src/lib/online-fra-web-admission');
+const { createOnlineFraWebSocketAdapter } = require('../src/lib/online-fra-websocket-adapter');
 
 const configPath = process.argv[2];
 if (!configPath) {
@@ -59,16 +62,78 @@ const service = (() => {
   }
 })();
 
-service.start().then(({ controlPort }) => {
+// THE EDGE, when the config names one. Behind nginx, which terminates TLS for
+// the relay hostname and proxies /v1/rendezvous here over loopback HTTP with
+// the client address in X-Real-IP. Admission is by key possession for every
+// role (see online-fra-web-admission.js); the mTLS verifier stays available
+// for a deployment that chooses to run it, and is inert when `edge.mtls` is
+// absent. `ws` is the one dependency, required only on this path, so a
+// control-only deployment still loads with nothing installed.
+//
+//   "edge": { "listenHost": "127.0.0.1", "listenPort": 4821,
+//             "hostname": "relay.example.net" }
+function startEdge() {
+  const edge = fileConfig.edge;
+  if (edge === undefined || edge === null) return Promise.resolve(null);
+  if (typeof edge !== 'object' || Array.isArray(edge)) { console.error('REFUSED: edge must be an object.'); process.exit(2); }
+  const listenHost = edge.listenHost || '127.0.0.1';
+  if (listenHost !== '127.0.0.1' && listenHost !== '::1') {
+    console.error('REFUSED: edge.listenHost must be loopback. TLS and the public address are nginx\'s; this process never faces the internet directly.');
+    process.exit(2);
+  }
+  const listenPort = Number.isInteger(edge.listenPort) ? edge.listenPort : 4821;
+  let WebSocketServer;
+  try { ({ WebSocketServer } = require('ws')); }
+  catch {
+    console.error('REFUSED: the edge needs the `ws` package (MIT). Install it beside this tree: npm install --omit=dev');
+    process.exit(2);
+  }
+  const httpServer = http.createServer((req, res) => {
+    // Only upgrades are served. A plain request gets a plain answer that names
+    // nothing about the relay's state.
+    res.statusCode = 426; res.setHeader('content-type', 'text/plain'); res.end('upgrade required');
+  });
+  const keyAdmission = createOnlineFraWebAdmission({ relay: service.relay, clock: () => Date.now() });
+  const adapter = createOnlineFraWebSocketAdapter({
+    enabled: true,
+    WebSocketServer,
+    httpServer,
+    relay: service.relay,
+    hostname: edge.hostname,
+    // No certificate path in this deployment: every request falls through to
+    // key admission. A deployment that terminates mTLS supplies a real
+    // verifier here instead.
+    verifyProxyRequest: () => ({ ok: false }),
+    keyAdmission,
+    eventSink: service.metadataSink.sink,
+    clock: () => Date.now(),
+    setTimer: (fn, ms) => setTimeout(fn, ms),
+    clearTimer: id => clearTimeout(id),
+    maxSockets: Number.isInteger(edge.maxSockets) ? edge.maxSockets : 64
+  });
+  adapter.start();
+  return new Promise((resolve, reject) => {
+    httpServer.once('error', reject);
+    httpServer.listen(listenPort, listenHost, () => resolve({ listenHost, listenPort, hostname: edge.hostname, adapter }));
+  });
+}
+
+service.start().then(async ({ controlPort }) => {
+  const edge = await startEdge();
   const snapshot = service.relay.snapshot();
   console.error('online-fra-relay-service up');
   console.error(`  control        : 127.0.0.1:${controlPort} (Bearer token from file)`);
   console.error(`  generation     : ${snapshot.generation}   pairs ${snapshot.pairCount}/${snapshot.maxPairs}`);
   console.error('  admission      : ASK -- account database read-only, fail closed');
   console.error('  event sink     : metadata-only, O(1), no identifiers retained');
-  console.error('  NOT YET SERVED : the websocket edge binds when the nginx vhost and');
-  console.error('                   device CA exist (provisioning); admission and control');
-  console.error('                   are complete without it.');
+  if (edge) {
+    console.error(`  edge           : ${edge.listenHost}:${edge.listenPort} for ${edge.hostname} -- behind nginx TLS`);
+    console.error('  edge admission : key possession (signed nonce) for web and machine roles');
+  } else {
+    console.error('  NOT YET SERVED : no edge configured -- add "edge" to the config to bind');
+    console.error('                   the websocket edge behind nginx; admission and control');
+    console.error('                   are complete without it.');
+  }
 }).catch(error => {
   console.error(`REFUSED AT START: ${error.code || error.message}`);
   process.exit(1);

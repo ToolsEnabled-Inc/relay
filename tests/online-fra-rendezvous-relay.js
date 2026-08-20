@@ -179,6 +179,24 @@ function run() {
     code(() => instance.connect({ identity: identity(a.deviceId, a.mtlsFingerprint, { verified: false }), lease: a }), 'ONLINE_FRA_MTLS_IDENTITY_INVALID');
   }
 
+  // KEY-LEASE FOR MACHINES (2026-08-20). A machine that proved possession of
+  // its own identity key at the edge is attested as key-lease, and the relay
+  // admits it for either machine role. web-lease stays the web role's alias
+  // and is NOT accepted for a machine; mtls is NOT accepted for the web role.
+  {
+    const instance = relay();
+    const a = lease({ role: 'machine-a' });
+    const b = lease({ role: 'machine-b' });
+    const ra = instance.connect({ identity: identity(a.deviceId, a.mtlsFingerprint, { authType: 'key-lease' }), lease: a });
+    const rb = instance.connect({ identity: identity(b.deviceId, b.mtlsFingerprint, { authType: 'key-lease' }), lease: b });
+    ok(ra.connectionId && rb.connectionId, 'both machines admitted on key-lease');
+    equal(instance.connectionMetadata(ra.connectionId).peerConnectionId, rb.connectionId, 'and they are paired');
+    const fresh = relay();
+    const c = lease({ role: 'machine-a' });
+    code(() => fresh.connect({ identity: identity(c.deviceId, c.mtlsFingerprint, { authType: 'web-lease' }), lease: c }), 'ONLINE_FRA_MTLS_IDENTITY_INVALID');
+    code(() => fresh.connect({ identity: identity(c.deviceId, c.mtlsFingerprint, { authType: 'bearer' }), lease: c }), 'ONLINE_FRA_MTLS_IDENTITY_INVALID');
+  }
+
   {
     const instance = relay();
     const malformedIdentity = identity('machine-a', fingerprintA);
