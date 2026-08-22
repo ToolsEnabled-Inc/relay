@@ -361,9 +361,31 @@ function createOnlineFraRendezvousRelay(options = {}) {
     if (!isPlain || keys.length !== 2 || affirmative !== true || revoked !== true) leaseStateUnavailable();
   }
 
+  /* WHY A CONNECTION WENT, KEPT JUST LONG ENOUGH TO BE ASKED.
+   *
+   * Closing a connection is a lifecycle event with a REASON -- displaced by a
+   * newer tab, pair revoked, lease expired -- and until now that reason went
+   * only to the event sink, which by design keeps no reasons. So the edge asked
+   * about a connection the relay had deliberately closed a moment earlier, got
+   * an unqualified "unknown", and reported it to the browser as an internal
+   * error. The page could then only say the person's computer had not answered.
+   * It had; a second tab had taken the slot, exactly as intended.
+   *
+   * Bounded and evicted oldest-first: this is a hint for a socket that has not
+   * noticed yet, not a record. The reasons are the same closed set of constants
+   * the sink already receives, so nothing new is retained and no identifier is. */
+  const closedReasons = new Map();
+  const MAX_CLOSED_REASONS = 256;
+  function rememberClosed(connectionId, reason) {
+    if (typeof reason !== 'string' || !/^ONLINE_FRA_[A-Z0-9_]{1,48}$/.test(reason)) return;
+    closedReasons.delete(connectionId);
+    closedReasons.set(connectionId, reason);
+    while (closedReasons.size > MAX_CLOSED_REASONS) closedReasons.delete(closedReasons.keys().next().value);
+  }
+
   function recordFor(connectionId) {
     const value = connections.get(connectionId);
-    if (!value || value.closed) fail('ONLINE_FRA_CONNECTION_UNKNOWN');
+    if (!value || value.closed) fail(closedReasons.get(connectionId) || 'ONLINE_FRA_CONNECTION_UNKNOWN');
     return value;
   }
 
@@ -392,6 +414,7 @@ function createOnlineFraRendezvousRelay(options = {}) {
     const peer = record.peerConnectionId ? connections.get(record.peerConnectionId) : null;
     if (peer && peer.peerConnectionId === record.connectionId) peer.peerConnectionId = null;
     record.peerConnectionId = null;
+    rememberClosed(record.connectionId, reason);
     if (emit) sink('online_fra.connection.closed', { connectionId: record.connectionId, pairId: record.pairId, deviceId: record.deviceId, reason });
     return true;
   }

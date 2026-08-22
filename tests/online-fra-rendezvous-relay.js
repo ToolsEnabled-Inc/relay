@@ -370,7 +370,15 @@ function run() {
     const instance = relay();
     const pair = connectPair(instance);
     nowMs += 60_001;
-    code(() => instance.connectionMetadata(pair.a.connectionId), 'ONLINE_FRA_CONNECTION_UNKNOWN');
+    /* THE REASON SURVIVES THE CLOSE, briefly, for whoever asks next.
+       This asserted 'ONLINE_FRA_CONNECTION_UNKNOWN' -- true but useless, and the
+       edge could only pass it on to a browser as an internal error. A person
+       whose tab had been displaced by their own second tab was told their
+       computer had not answered. It had. So a connection the relay closed for a
+       known reason now names that reason to the next caller; a connection id it
+       has genuinely never heard of is still 'unknown'. */
+    code(() => instance.connectionMetadata(pair.a.connectionId), 'ONLINE_FRA_LEASE_EXPIRED');
+    code(() => instance.connectionMetadata('never-issued-by-this-relay'), 'ONLINE_FRA_CONNECTION_UNKNOWN');
     equal(instance.snapshot().activeConnections, 0);
   }
 
@@ -534,7 +542,9 @@ function run() {
       const aLease = lease({ pair: pairNew, role: 'machine-a', overrides: { mtlsFingerprint: fingerprintC } });
       const a = instance.connect({ identity: identity(aLease.deviceId, fingerprintC), lease: aLease });
       equal(instance.retirePair({ pairId: 'pair-ef' }), true, 'retirement answers plainly');
-      code(() => instance.connectionMetadata(a.connectionId), 'ONLINE_FRA_CONNECTION_UNKNOWN');
+      /* Names the retirement rather than 'unknown', for the same reason as the
+         expiry case above: the edge is asking why its socket stopped working. */
+      code(() => instance.connectionMetadata(a.connectionId), 'ONLINE_FRA_PAIR_RETIRED');
       code(() => instance.connect({ identity: identity(pairNew.machineAId, fingerprintC), lease: lease({ pair: pairNew, role: 'machine-a', overrides: { mtlsFingerprint: fingerprintC } }) }), 'ONLINE_FRA_LEASE_BINDING_INVALID');
       ok(events.some(event => event.type === 'online_fra.pair.retired' && event.pairId === 'pair-ef'),
         'retirement is an audited event');
@@ -678,9 +688,18 @@ function run() {
     const first = displacing.connect({ identity: webIdentity(firstLease), lease: firstLease });
     const secondLease = webLease({ deviceId: `web-${'f'.repeat(24)}` });
     const second = displacing.connect({ identity: webIdentity(secondLease), lease: secondLease });
-    code(() => displacing.connectionMetadata(first.connectionId), 'ONLINE_FRA_CONNECTION_UNKNOWN');
+    /* THE COMMENT BELOW SAID "the old browser tab is told it was displaced", and
+       it was not true of the tab -- only of the event sink, which no browser can
+       read. The tab's own edge asked this very question and was told 'unknown',
+       closed the socket as an internal error, and the page reported that the
+       person's computer had not answered. It had; their own second tab had taken
+       the slot, exactly as designed. Measured on production 2026-08-22: tab one
+       answered before tab two opened and timed out after it, saying "The machine
+       did not answer. It may be switched off."
+       So the reason is now answerable by the party that needs it. */
+    code(() => displacing.connectionMetadata(first.connectionId), 'ONLINE_FRA_WEB_DISPLACED');
     ok(events.some(event => event.type === 'online_fra.connection.closed' && event.reason === 'ONLINE_FRA_WEB_DISPLACED'),
-      'the old browser tab is told it was displaced');
+      'the displacement is audited as well as answerable');
     equal(displacing.connectionMetadata(second.connectionId).endpointRole, 'web-client');
     // And the machines never noticed.
     equal(displacing.route({ connectionId: pairTwoConns.a.connectionId, peerConnectionId: pairTwoConns.b.connectionId, frame: Buffer.from('still') }).delivered, true);

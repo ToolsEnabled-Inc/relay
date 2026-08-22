@@ -106,6 +106,11 @@ function startEdge() {
     verifyProxyRequest: () => ({ ok: false }),
     keyAdmission,
     eventSink: service.metadataSink.sink,
+    /* The operator's line. The metadata sink is the durable record and
+       keeps no reasons on purpose; this is the volatile one a person
+       reads in the journal when a machine will not stay connected. It
+       carries no identifiers -- see closeContext for what is in it. */
+    log: line => console.error(`online-fra-ws: ${line}`),
     clock: () => Date.now(),
     setTimer: (fn, ms) => setTimeout(fn, ms),
     clearTimer: id => clearTimeout(id),
@@ -118,12 +123,18 @@ function startEdge() {
   });
 }
 
-service.start().then(async ({ controlPort }) => {
+service.start().then(async ({ controlPort, recovery }) => {
   const edge = await startEdge();
   const snapshot = service.relay.snapshot();
   console.error('online-fra-relay-service up');
   console.error(`  control        : 127.0.0.1:${controlPort} (Bearer token from file)`);
   console.error(`  generation     : ${snapshot.generation}   pairs ${snapshot.pairCount}/${snapshot.maxPairs}`);
+  /* SAID OUT LOUD, because a relay that came up with no pairs used to look
+     identical to one that came up with all of them -- and every machine on the
+     box was refused until somebody re-made the connection by hand. */
+  console.error(recovery && recovery.readable
+    ? `  pairs restored : ${recovery.recovered} from the account database`      + `${recovery.conflicts ? `, ${recovery.conflicts} skipped on a generation conflict` : ''}`      + `${recovery.skipped ? `, ${recovery.skipped} unreadable` : ''}`
+    : '  pairs restored : NONE -- the account database could not be read, so every machine will be refused until it is');
   console.error('  admission      : ASK -- account database read-only, fail closed');
   console.error('  event sink     : metadata-only, O(1), no identifiers retained');
   if (edge) {

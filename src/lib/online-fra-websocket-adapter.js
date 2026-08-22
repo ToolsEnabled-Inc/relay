@@ -28,11 +28,25 @@ const HEX = /^[a-f0-9]{64}$/;
 const CONNECTION_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const LEG_BYTE = Object.freeze({ 'machine-a': 0x01, 'machine-b': 0x02, 'web-client': 0x03 });
 const LEG_ROLE = Object.freeze({ 0x01: 'machine-a', 0x02: 'machine-b', 0x03: 'web-client' });
+/* OUR OWN CLOSE CODE FOR "A NEWER TAB TOOK YOUR SLOT", in the private range
+   (4000-4999) because it is ours and not the protocol's. The browser client
+   reads it and says so; without a code of its own this arrived as a generic
+   internal error and the page could only guess. */
+const CLOSE_DISPLACED = 4001;
+/* Reasons the relay closes a connection deliberately. Each is a normal end to a
+   connection, not a fault of this edge, and each closes 1000 rather than 1011 so
+   an operator counting internal errors is counting real ones. */
+const RELAY_ENDED_IT = new Set([
+  'ONLINE_FRA_LEASE_EXPIRED', 'ONLINE_FRA_PAIR_REVOKED', 'ONLINE_FRA_PAIR_RETIRED', 'ONLINE_FRA_CONNECTION_UNKNOWN'
+]);
 const DEFAULTS = Object.freeze({
   enabled: false, maxFrameBytes: 262144, maxAdmissionBytes: 8192, maxSockets: 64,
   maxSocketsPerIp: 4, maxAdmissionsPerIp: 12, admissionWindowMs: 60_000,
   admissionTimeoutMs: 10_000, pingIntervalMs: 30_000, idleTimeoutMs: 75_000,
-  maxBufferedBytes: 524288, maxDrainPerTick: 16
+  maxBufferedBytes: 524288, maxDrainPerTick: 16,
+  /* An operator's line, off by default. The service passes one; tests and
+     embedders that pass nothing behave exactly as they did. */
+  log: () => {}
 });
 
 class OnlineFraWebSocketAdapterError extends Error {
@@ -49,7 +63,7 @@ function metadataFingerprint(attestation) { return crypto.createHash('sha256').u
 function createOnlineFraWebSocketAdapter(options = {}) {
   const allowed = new Set([
     'WebSocketServer', 'enabled', 'eventSink', 'hostname', 'httpServer', 'relay', 'verifyProxyRequest',
-    'keyAdmission', 'clientIpFor',
+    'keyAdmission', 'clientIpFor', 'log',
     'clock', 'setTimer', 'clearTimer', 'maxFrameBytes', 'maxAdmissionBytes', 'maxSockets', 'maxSocketsPerIp',
     'maxAdmissionsPerIp', 'admissionWindowMs', 'admissionTimeoutMs', 'pingIntervalMs', 'idleTimeoutMs',
     'maxBufferedBytes', 'maxDrainPerTick'
@@ -146,7 +160,22 @@ function createOnlineFraWebSocketAdapter(options = {}) {
   function isOpen(ws) { return ws && (ws.readyState === undefined || ws.readyState === 1); }
   function relayCall(method, ...args) {
     try { return sync(config.relay[method](...args), 'ONLINE_FRA_WS_RELAY_ASYNC'); }
-    catch (error) { if (error instanceof OnlineFraWebSocketAdapterError) throw error; fail('ONLINE_FRA_WS_RELAY_FAILED'); }
+    catch (error) {
+      if (error instanceof OnlineFraWebSocketAdapterError) throw error;
+      /* CARRY THE RELAY'S REASON ALONGSIDE, without changing this error's own
+         code -- every existing caller and test still sees the same
+         ONLINE_FRA_WS_RELAY_FAILED. It is carried because this wrapper was
+         throwing away the one fact the caller needed: the relay closes a
+         connection deliberately (a newer browser tab displacing an older one,
+         an expired lease, a retired pair) and, with the reason gone, drain()
+         could only report every one of them as an internal error. A person's
+         displaced tab then told them their computer had not answered.
+         Shape-guarded, so only a relay constant travels -- never a message. */
+      const wrapped = new OnlineFraWebSocketAdapterError('ONLINE_FRA_WS_RELAY_FAILED');
+      wrapped.relayCode = typeof error === 'object' && error !== null && typeof error.code === 'string'
+        && /^ONLINE_FRA_[A-Z0-9_]{1,48}$/.test(error.code) ? error.code : null;
+      throw wrapped;
+    }
   }
   function closeRelay(context) {
     if (!context.connectionId || context.relayClosed) return;
@@ -161,6 +190,21 @@ function createOnlineFraWebSocketAdapter(options = {}) {
     releaseSlot(context.attestation.ip);
     closeRelay(context);
     try { emit('online_fra.ws.closed', { reason, session: context.meta }); } catch {}
+    /* SAY WHY, WHERE AN OPERATOR CAN READ IT. The metadata sink counts closes
+       by type and keeps no reason, which is right for a privacy-preserving
+       record and useless when a machine will not stay connected. Diagnosing
+       three separate causes tonight -- a lost pair topology, an exhausted
+       per-device connection budget, and an admission the client believed had
+       succeeded -- each required hand-patching this function on the live box,
+       because the machine end cannot tell a refusal from a network fault and
+       the relay was the only party that knew.
+       Identifier-free by construction: a reason from the closed set above, the
+       close code, whether admission had completed, and the leg's role. No
+       device id, no pair id, no address, nothing the sink itself would
+       refuse to keep. */
+    try {
+      config.log(`connection closed: reason=${reason} code=${code} admitted=${Boolean(context.admitted)} role=${context.role || 'none'} detail=${context.detail || 'none'}`);
+    } catch { /* a logger that throws must not stop a close */ }
     if (!socketAlreadyClosed) {
       try { if (context.ws && typeof context.ws.close === 'function') context.ws.close(code); } catch {}
       try {
@@ -208,7 +252,47 @@ function createOnlineFraWebSocketAdapter(options = {}) {
         if (typeof context.ws.send !== 'function') fail('ONLINE_FRA_WS_SEND_UNAVAILABLE');
         context.ws.send(Buffer.from(frame), { binary: true });
       }
-    } catch { closeContext(context, 'relay_drain_failed', 1011); }
+    } catch (error) {
+      /* A CONNECTION THE RELAY CLOSED ON PURPOSE IS NOT AN INTERNAL ERROR.
+         Everything here closed as 1011 relay_drain_failed, including the most
+         ordinary event on this edge: a person's newer browser tab displacing
+         their older one. The older tab's page could then only report that the
+         computer had not answered, which was false and unactionable. The relay
+         now names the reason it closed a connection, so the ones it MEANT are
+         reported as what they are and the browser can say the true thing. */
+      const code = typeof error === 'object' && error !== null ? error.relayCode : null;
+      if (code === 'ONLINE_FRA_WEB_DISPLACED') { context.detail = code; return closeContext(context, 'displaced', CLOSE_DISPLACED); }
+      if (RELAY_ENDED_IT.has(code)) { context.detail = code; return closeContext(context, 'relay_ended_connection', 1000); }
+      closeContext(context, 'relay_drain_failed', 1011);
+    }
+  }
+  /* DELIVER TO THE RECEIVER, WHICH IS THE WHOLE POINT OF HAVING ROUTED.
+   *
+   * A routed frame is queued against the TARGET's connection, and only that
+   * target's own drain() takes it off the queue. Routing used to drain the
+   * SENDER and nobody else, which left the sole periodic drain as schedule()'s
+   * timer at min(admissionTimeoutMs, pingIntervalMs) -- ten seconds at the
+   * shipped defaults. So a request handed to a machine that was sitting idle
+   * (which is what a machine waiting for work IS) waited up to ten seconds to
+   * be delivered, and its answer up to ten seconds more. Twenty seconds for a
+   * round trip the tunnel itself completes in single-digit milliseconds.
+   *
+   * It was invisible everywhere it was tested: every in-process test drives
+   * both legs through a synchronous shim, where each leg is drained by its own
+   * next send. Only two real sockets with one idle end show it, which is
+   * exactly the shape of the product.
+   *
+   * The lookup is a scan of the live set, bounded by maxSockets. The periodic
+   * timer stays as the backstop for a receiver that was over its buffer ceiling
+   * when the frame arrived. */
+  function deliverTo(connectionId) {
+    let target = null;
+    for (const candidate of live) {
+      if (candidate.connectionId === connectionId) { target = candidate; break; }
+    }
+    /* Drained outside the loop: drain() can close a context, and closing
+       removes it from the set being iterated. */
+    if (target) drain(target);
   }
   function admit(context, data, binary) {
     if (binary || !Buffer.isBuffer(data) || data.length < 1 || data.length > config.maxAdmissionBytes) fail('ONLINE_FRA_WS_ADMISSION_INVALID');
@@ -224,7 +308,16 @@ function createOnlineFraWebSocketAdapter(options = {}) {
         || parsed.lease === null || typeof parsed.nonce !== 'string' || parsed.nonce !== context.challengeNonce) fail('ONLINE_FRA_WS_ADMISSION_INVALID');
       try {
         connected = sync(config.keyAdmission.admit({ lease: parsed.lease, browserPublicKeySpki: parsed.publicKeySpki, nonce: parsed.nonce, signature: parsed.signature }), 'ONLINE_FRA_WS_RELAY_ASYNC');
-      } catch (error) { if (error instanceof OnlineFraWebSocketAdapterError) throw error; fail('ONLINE_FRA_WS_ADMISSION_INVALID'); }
+      } catch (error) { if (error instanceof OnlineFraWebSocketAdapterError) throw error;
+        /* KEEP THE REASON, AND ONLY THE REASON. keyAdmission refuses with a
+           code from a closed set -- a bad signature, a lease bound to another
+           pair, an exhausted per-device budget -- and collapsing all three
+           into `admission_failed` is what made this take three nights. The
+           shape guard is the privacy line: a SCREAMING_CASE constant is kept,
+           anything else (a message, a path, an address) becomes 'unknown'. */
+        context.detail = typeof error === 'object' && error !== null && typeof error.code === 'string'
+          && /^[A-Z][A-Z0-9_]{2,63}$/.test(error.code) ? error.code : 'unknown';
+        fail('ONLINE_FRA_WS_ADMISSION_INVALID'); }
       if (!plain(connected) || !CONNECTION_ID.test(connected.connectionId)) fail('ONLINE_FRA_WS_RELAY_CONNECT_INVALID');
       // Identity is known now; the session label follows it.
       context.attestation = Object.freeze({ mode: 'key', deviceId: String(parsed.lease.deviceId), fingerprint: String(parsed.lease.mtlsFingerprint), ip: context.attestation.ip });
@@ -284,11 +377,15 @@ function createOnlineFraWebSocketAdapter(options = {}) {
       frame[0] = LEG_BYTE[context.role];
       relayCall('route', { connectionId: context.connectionId, peerConnectionId: targetId, frame });
       drain(context);
-    } catch { closeContext(context, context.admitted ? 'frame_invalid' : 'admission_failed'); }
+      deliverTo(targetId);
+    } catch (error) {
+      if (error instanceof OnlineFraWebSocketAdapterError && !context.detail) context.detail = error.code;
+      closeContext(context, context.admitted ? 'frame_invalid' : 'admission_failed');
+    }
   }
   function attach(ws, attestation) {
     const context = { ws, attestation, meta: metadataFingerprint(attestation), timer: null, cleaned: false, admitted: false,
-      relayClosed: false, challengeNonce: null, role: null,
+      relayClosed: false, challengeNonce: null, role: null, detail: null,
       connectionId: null, peerConnectionId: null, admissionDeadline: config.clock() + config.admissionTimeoutMs,
       lastActivity: config.clock(), lastPing: config.clock() };
     live.add(context);

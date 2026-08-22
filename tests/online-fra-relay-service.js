@@ -108,7 +108,15 @@ async function controlCall(port, name, body, token = TOKEN) {
 
     const health = await controlCall(controlPort, 'health');
     equal(health.status, 200);
-    equal(health.body.relay.pairCount, 0, 'a fresh hosted relay starts with zero pairs');
+    /* ONE, NOT ZERO -- and the change is the fix, not a regression. This
+       fixture seeds the account database with exactly this pair, both machines
+       enrolled, and the relay now rebuilds its topology from that database at
+       boot. It used to start empty, which meant every restart of this service
+       silently dropped every pair on the box: machines presented valid leases
+       and were refused ONLINE_FRA_LEASE_BINDING_INVALID until somebody deleted
+       the connection and made it again. See tests/online-fra-pair-recovery.js. */
+    equal(health.body.relay.pairCount, 1,
+      'a hosted relay must restore the live pairs its account database already holds -- starting empty is how a restart disconnects everybody');
     equal(health.body.events.identifiersRetained, false);
 
     const registered = await controlCall(controlPort, 'register-pair', {
@@ -116,7 +124,13 @@ async function controlCall(port, name, body, token = TOKEN) {
       machineAId: 'device-' + 'a'.repeat(24), machineBId: 'device-' + 'b'.repeat(24)
     });
     equal(registered.status, 200);
-    equal(registered.body.outcome, 'registered');
+    /* 'already-registered', because the boot recovery restored this very pair
+       from the account database a moment ago. A second register-pair for an
+       identical pair must SUCCEED: the account service retries, and answering
+       409 would make it undo the person's connection. A pair whose generation
+       or digest actually moved is still refused, by initializePair, before
+       this line is reached. */
+    equal(registered.body.outcome, 'already-registered');
     equal((await controlCall(controlPort, 'health')).body.relay.pairCount, 1);
 
     // Deletion is the composed teardown, idempotent end to end.
