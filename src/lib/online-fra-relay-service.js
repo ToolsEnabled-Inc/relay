@@ -35,6 +35,16 @@ const ASK_SQL = `SELECT rp.account_id AS accountId FROM relay_pairs rp
   JOIN devices b ON b.pair_id = rp.b_pair_id AND b.revoked_at_ms IS NULL
   WHERE rp.relay_pair_id = ?`;
 
+/* EVERY LIVE PAIR, FOR THE RECOVERY BELOW. The same join the ASK authority
+   makes, without the id filter: a pair is live when both its machines are
+   still enrolled, and the account service is the one that decides that. */
+const LIVE_PAIRS_SQL = `SELECT rp.relay_pair_id AS pairId, rp.capability_digest AS capabilityDigest,
+    a.device_id AS machineAId, b.device_id AS machineBId
+  FROM relay_pairs rp
+  JOIN devices a ON a.pair_id = rp.a_pair_id AND a.revoked_at_ms IS NULL
+  JOIN devices b ON b.pair_id = rp.b_pair_id AND b.revoked_at_ms IS NULL
+  WHERE a.device_id IS NOT NULL AND b.device_id IS NOT NULL`;
+
 class OnlineFraRelayServiceError extends Error {
   constructor(code, message) {
     super(message || code);
@@ -346,10 +356,28 @@ function createOnlineFraRelayService(config = {}) {
         pairId: body.pairId, generation: body.generation, capabilityDigest: body.capabilityDigest
       });
       if (initialized.outcome === 'conflict') return { ok: false, outcome: 'conflict' };
-      const receipt = relay.registerPair({
-        pairId: body.pairId, machineAId: body.machineAId,
-        machineBId: body.machineBId, capabilityDigest: body.capabilityDigest
-      });
+      let receipt;
+      try {
+        receipt = relay.registerPair({
+          pairId: body.pairId, machineAId: body.machineAId,
+          machineBId: body.machineBId, capabilityDigest: body.capabilityDigest
+        });
+      } catch (error) {
+        /* ALREADY REGISTERED IS A SUCCESS, NOT A REFUSAL -- and since the boot
+           recovery below, it is the ordinary case rather than a strange one:
+           this service rebuilds its topology from the account database at
+           start, so a pair formed before a restart is already here the next
+           time the account service speaks about it. Answering 409 would make
+           the account service undo a person's connection over a retry it was
+           right to make.
+
+           Narrow on purpose. initializePair has already compared the
+           generation and the capability digest against the durable record and
+           answered `conflict` if either moved, so reaching this line means it
+           is the same pair. Every other failure still refuses. */
+        if (error.code !== 'ONLINE_FRA_RELAY_PAIR_INVALID') throw error;
+        return { ok: true, outcome: 'already-registered', pairCount: relay.snapshot().pairCount };
+      }
       return { ok: true, outcome: 'registered', pairCount: receipt.pairCount };
     },
     'retire-pair': body => {
@@ -401,9 +429,65 @@ function createOnlineFraRelayService(config = {}) {
     }).catch(() => answer(400, { ok: false, code: 'CONTROL_BODY_INVALID' }));
   }
 
+  /* THE PAIR TOPOLOGY SURVIVES A RESTART, BECAUSE IT NEVER DID.
+   *
+   * A pair reached this process exactly one way: the account service calling
+   * `register-pair` over the control channel the moment a person connected two
+   * computers. `relay.registerPair` puts it in an in-memory map. The lease
+   * state beneath it is durable sqlite; the topology on top of it was not.
+   *
+   * So every restart of this service -- a deploy, a crash, a reboot -- silently
+   * dropped every pair on the box. Machines then presented perfectly valid,
+   * freshly minted leases and were refused ONLINE_FRA_LEASE_BINDING_INVALID at
+   * `pairs.get(source.pairId)`, which reads to the machine as an admission
+   * failure it cannot explain and to the person as a computer that stopped
+   * answering for no reason. Nothing recovered: the account service only calls
+   * register-pair when a pair is FORMED, so a person's machines stayed dark
+   * until they deleted the connection and made it again. Measured, not
+   * theorised: restarting this service mid-session turned a working pair into
+   * an admission failure on the next connect, every time.
+   *
+   * The account database is already open here, read-only, for the ASK
+   * authority. It holds the same three facts register-pair carries. So the
+   * topology is rebuilt from it at boot, and the durable lease state is
+   * re-initialised alongside -- `initializePair` answers `conflict` only when a
+   * digest CHANGED, which is a real generation conflict and is skipped and
+   * counted rather than forced.
+   *
+   * Read-only, fail-soft, and loud in the boot banner: a relay that cannot
+   * rebuild its topology must still start and refuse honestly, because a relay
+   * that refuses to boot serves nobody at all. */
+  function recoverPairs() {
+    const outcome = { recovered: 0, conflicts: 0, skipped: 0, readable: false };
+    if (!accountDb) return outcome;
+    let rows;
+    try { rows = accountDb.prepare(LIVE_PAIRS_SQL).all(); } catch { return outcome; }
+    outcome.readable = true;
+    /* Taken from the relay rather than from config, so the durable lease state
+       is initialised with exactly the generation the relay will later compare a
+       lease against. Reading it twice from two places is how those two numbers
+       start to differ. */
+    const relayGeneration = relay.snapshot().generation;
+    for (const row of rows) {
+      try {
+        const initialized = leaseState.initializePair({
+          pairId: row.pairId, generation: relayGeneration, capabilityDigest: row.capabilityDigest,
+        });
+        if (initialized.outcome === 'conflict') { outcome.conflicts += 1; continue; }
+        relay.registerPair({
+          pairId: row.pairId, machineAId: row.machineAId,
+          machineBId: row.machineBId, capabilityDigest: row.capabilityDigest,
+        });
+        outcome.recovered += 1;
+      } catch { outcome.skipped += 1; }
+    }
+    return outcome;
+  }
+
   function start() {
     openAccountDb();
     leaseState.open();
+    const recovery = recoverPairs();
     if (report) {
       reportTimer = setInterval(() => { flushReports(); }, Number.isInteger(report.flushMs) ? report.flushMs : 30_000);
       if (reportTimer.unref) reportTimer.unref();
@@ -411,7 +495,7 @@ function createOnlineFraRelayService(config = {}) {
     controlServer = http.createServer(handleControl);
     return new Promise((resolve, reject) => {
       controlServer.once('error', reject);
-      controlServer.listen(controlPort, controlHost, () => resolve({ controlPort: controlServer.address().port }));
+      controlServer.listen(controlPort, controlHost, () => resolve({ controlPort: controlServer.address().port, recovery }));
     });
   }
 
