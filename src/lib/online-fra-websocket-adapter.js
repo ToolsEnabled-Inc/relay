@@ -210,6 +210,34 @@ function createOnlineFraWebSocketAdapter(options = {}) {
       }
     } catch { closeContext(context, 'relay_drain_failed', 1011); }
   }
+  /* DELIVER TO THE RECEIVER, WHICH IS THE WHOLE POINT OF HAVING ROUTED.
+   *
+   * A routed frame is queued against the TARGET's connection, and only that
+   * target's own drain() takes it off the queue. Routing used to drain the
+   * SENDER and nobody else, which left the sole periodic drain as schedule()'s
+   * timer at min(admissionTimeoutMs, pingIntervalMs) -- ten seconds at the
+   * shipped defaults. So a request handed to a machine that was sitting idle
+   * (which is what a machine waiting for work IS) waited up to ten seconds to
+   * be delivered, and its answer up to ten seconds more. Twenty seconds for a
+   * round trip the tunnel itself completes in single-digit milliseconds.
+   *
+   * It was invisible everywhere it was tested: every in-process test drives
+   * both legs through a synchronous shim, where each leg is drained by its own
+   * next send. Only two real sockets with one idle end show it, which is
+   * exactly the shape of the product.
+   *
+   * The lookup is a scan of the live set, bounded by maxSockets. The periodic
+   * timer stays as the backstop for a receiver that was over its buffer ceiling
+   * when the frame arrived. */
+  function deliverTo(connectionId) {
+    let target = null;
+    for (const candidate of live) {
+      if (candidate.connectionId === connectionId) { target = candidate; break; }
+    }
+    /* Drained outside the loop: drain() can close a context, and closing
+       removes it from the set being iterated. */
+    if (target) drain(target);
+  }
   function admit(context, data, binary) {
     if (binary || !Buffer.isBuffer(data) || data.length < 1 || data.length > config.maxAdmissionBytes) fail('ONLINE_FRA_WS_ADMISSION_INVALID');
     let parsed;
@@ -284,6 +312,7 @@ function createOnlineFraWebSocketAdapter(options = {}) {
       frame[0] = LEG_BYTE[context.role];
       relayCall('route', { connectionId: context.connectionId, peerConnectionId: targetId, frame });
       drain(context);
+      deliverTo(targetId);
     } catch { closeContext(context, context.admitted ? 'frame_invalid' : 'admission_failed'); }
   }
   function attach(ws, attestation) {
