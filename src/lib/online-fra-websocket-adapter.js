@@ -40,8 +40,24 @@ const RELAY_ENDED_IT = new Set([
   'ONLINE_FRA_LEASE_EXPIRED', 'ONLINE_FRA_PAIR_REVOKED', 'ONLINE_FRA_PAIR_RETIRED', 'ONLINE_FRA_CONNECTION_UNKNOWN'
 ]);
 const DEFAULTS = Object.freeze({
-  enabled: false, maxFrameBytes: 262144, maxAdmissionBytes: 8192, maxSockets: 64,
-  maxSocketsPerIp: 4, maxAdmissionsPerIp: 12, admissionWindowMs: 60_000,
+  enabled: false, maxFrameBytes: 262144, maxAdmissionBytes: 8192, maxSockets: 512,
+  /* PER-IP LIMITS ARE ABUSE CONTROLS, AND THE OLD ONES WERE SET AGAINST THE
+     WRONG PICTURE OF A CUSTOMER.
+     Four sockets and twelve admissions a minute assumes one person per address.
+     This product's premise is the opposite: every customer holds at least TWO
+     persistent sockets, one per computer, plus a socket for each browser tab
+     driving them -- and a household, an office or a university shares a single
+     public address between all of them. A family with two computers and two
+     tabs open was at the ceiling.
+     Measured 2026-08-22, on a deployment where the proxy was not forwarding a
+     client address at all, so the whole service shared ONE budget of four: four
+     sockets from one house, and the fifth destroyed mid-upgrade -- which nginx
+     reports as 502, so the browser said the connection could not be opened and
+     had nothing to point at.
+     These are still bounded, and the global ceiling above is what protects the
+     process. What changed is that the per-address numbers now describe a
+     building rather than a person. */
+  maxSocketsPerIp: 64, maxAdmissionsPerIp: 120, admissionWindowMs: 60_000,
   admissionTimeoutMs: 10_000, pingIntervalMs: 30_000, idleTimeoutMs: 75_000,
   maxBufferedBytes: 524288, maxDrainPerTick: 16,
   /* An operator's line, off by default. The service passes one; tests and
@@ -136,9 +152,35 @@ function createOnlineFraWebSocketAdapter(options = {}) {
     if (!safeIp(ip)) return null;
     return Object.freeze({ mode: 'key', deviceId: 'pending', fingerprint: '0'.repeat(64), ip });
   }
+  /* WHOSE BUDGET THIS SOCKET SPENDS.
+   *
+   * Behind a reverse proxy the socket's own peer is the PROXY, so without a
+   * forwarded address every visitor on earth resolves to 127.0.0.1 and shares
+   * ONE per-address budget. Measured on production 2026-08-22: the whole relay
+   * was capped at four concurrent sockets and twelve admissions a minute for all
+   * customers together. Machines already through the door kept working, which is
+   * what made it invisible; the next connection was destroyed mid-upgrade and
+   * nginx reported that as 502, so a browser said the connection could not be
+   * opened and had nothing to point at.
+   *
+   * TWO HEADERS, BECAUSE THIS PROJECT ALREADY SENDS THE SECOND ONE. The nginx
+   * config this very repository generates sets X-FRA-Client-Address, and only
+   * the certificate door was reading it -- through the proxy attestation. The
+   * key door read x-real-ip and nothing else, so a deployment following our own
+   * reference config had no client address on the door it actually uses. The
+   * two halves of one project disagreed about the name.
+   *
+   * Both are trusted because both are set by the proxy in front, which
+   * overwrites whatever a client sent. A deployment that forwards neither gets
+   * the socket's peer, which is correct when there is no proxy and is the
+   * conservative answer when there is one -- everybody shares a budget, which
+   * is a service that refuses rather than a limit that does not apply. */
   function defaultClientIp(req) {
-    const header = req && req.headers ? req.headers['x-real-ip'] : undefined;
-    if (typeof header === 'string' && safeIp(header.trim())) return header.trim();
+    const headers = req && req.headers ? req.headers : {};
+    for (const name of ['x-real-ip', 'x-fra-client-address']) {
+      const value = headers[name];
+      if (typeof value === 'string' && safeIp(value.trim())) return value.trim();
+    }
     return req && req.socket ? req.socket.remoteAddress : null;
   }
   function admissionSlot(ip) {
@@ -203,7 +245,13 @@ function createOnlineFraWebSocketAdapter(options = {}) {
        device id, no pair id, no address, nothing the sink itself would
        refuse to keep. */
     try {
-      config.log(`connection closed: reason=${reason} code=${code} admitted=${Boolean(context.admitted)} role=${context.role || 'none'} detail=${context.detail || 'none'}`);
+      /* The drop tally rides along on the close line: a socket that spent its
+         whole life talking to a leg that was not there is the single most
+         useful thing this log can say about it. */
+      const dropped = context.dropped
+        ? Object.keys(context.dropped).map(role => `${role}x${context.dropped[role]}`).join(',')
+        : 'none';
+      config.log(`connection closed: reason=${reason} code=${code} admitted=${Boolean(context.admitted)} role=${context.role || 'none'} detail=${context.detail || 'none'} dropped=${dropped}`);
     } catch { /* a logger that throws must not stop a close */ }
     if (!socketAlreadyClosed) {
       try { if (context.ws && typeof context.ws.close === 'function') context.ws.close(code); } catch {}
@@ -367,6 +415,22 @@ function createOnlineFraWebSocketAdapter(options = {}) {
         // relay never delivered it, so nothing sealed went anywhere.
         context.lastActivity = config.clock();
         try { emit('online_fra.ws.frame_dropped', { reason: 'leg_absent', session: context.meta }); } catch {}
+        /* AND IT IS SAID OUT LOUD, ONCE, because "normal" and "silent" are not
+           the same thing and treating them as one cost a day.
+           A browser whose machine is missing retries its hello every second for
+           thirty seconds and every one of those was dropped here without a
+           trace, so the machine looked switched off while it was connected and
+           the relay looked healthy while it was delivering nothing. The event
+           above has existed the whole time; nothing was listening to it.
+           Bounded on purpose: the FIRST drop per socket per missing leg gets a
+           line, the rest are counted and reported when the socket closes. Thirty
+           identical lines per dial would be its own kind of silence. */
+        context.dropped = context.dropped || Object.create(null);
+        context.dropped[targetRole] = (context.dropped[targetRole] || 0) + 1;
+        if (context.dropped[targetRole] === 1) {
+          config.log(`frame dropped: no ${targetRole} leg on this pair to deliver to`
+            + ` (from ${context.role || 'none'})`);
+        }
         return;
       }
       if (!CONNECTION_ID.test(targetId)) fail('ONLINE_FRA_WS_RELAY_CONNECT_INVALID');
